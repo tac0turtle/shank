@@ -1,16 +1,18 @@
-use crate::Multiaddr;
+use super::score::PeerScore;
+pub use libp2p::core::Multiaddr;
 use serde::{
     ser::{SerializeStruct, Serializer},
     Serialize,
 };
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
-use strum::AsRefStr;
 
 /// Information about a given connected peer.
 #[derive(Clone, Debug, Serialize)]
 pub struct PeerInfo {
     /// The peers reputation, represented as a integer
-    score: Uint64,
+    score: PeerScore,
     /// Connection status of this peer
     connection_status: PeerConnectionStatus,
     /// The known listening addresses of this peer. This is given by identify and can be arbitrary
@@ -29,7 +31,7 @@ pub struct PeerInfo {
 impl Default for PeerInfo {
     fn default() -> Self {
         PeerInfo {
-            score: 0,
+            score: PeerScore::default(),
             connection_status: PeerConnectionStatus::Unknown,
             listening_addresses: Vec::new(),
             seen_addresses: HashSet::new(),
@@ -39,7 +41,20 @@ impl Default for PeerInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, AsRefStr)]
+impl PeerInfo {
+    pub fn trusted_peer() -> Self {
+        PeerInfo {
+            score: PeerScore::max(),
+            connection_status: PeerConnectionStatus::Unknown,
+            listening_addresses: Vec::new(),
+            seen_addresses: HashSet::new(),
+            is_trusted: true,
+            connection_direction: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub enum ConnectionDirection {
     /// The connection was established by a peer dialing us.
     Incoming,
@@ -80,4 +95,56 @@ pub enum PeerConnectionStatus {
     /// The connection status has not been specified.
     #[default]
     Unknown,
+}
+
+/// Serialization for http requests.
+impl Serialize for PeerConnectionStatus {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut s = serializer.serialize_struct("connection_status", 6)?;
+        match self {
+            PeerConnectionStatus::Connected { n_in, n_out } => {
+                s.serialize_field("status", "connected")?;
+                s.serialize_field("connections_in", n_in)?;
+                s.serialize_field("connections_out", n_out)?;
+                s.serialize_field("last_seen", &0)?;
+                s.end()
+            }
+            PeerConnectionStatus::Disconnecting { .. } => {
+                s.serialize_field("status", "disconnecting")?;
+                s.serialize_field("connections_in", &0)?;
+                s.serialize_field("connections_out", &0)?;
+                s.serialize_field("last_seen", &0)?;
+                s.end()
+            }
+            PeerConnectionStatus::Disconnected { since } => {
+                s.serialize_field("status", "disconnected")?;
+                s.serialize_field("connections_in", &0)?;
+                s.serialize_field("connections_out", &0)?;
+                s.serialize_field("last_seen", &since.elapsed().as_secs())?;
+                s.serialize_field("banned_ips", &Vec::<IpAddr>::new())?;
+                s.end()
+            }
+            PeerConnectionStatus::Banned { since } => {
+                s.serialize_field("status", "banned")?;
+                s.serialize_field("connections_in", &0)?;
+                s.serialize_field("connections_out", &0)?;
+                s.serialize_field("last_seen", &since.elapsed().as_secs())?;
+                s.end()
+            }
+            PeerConnectionStatus::Dialing { since } => {
+                s.serialize_field("status", "dialing")?;
+                s.serialize_field("connections_in", &0)?;
+                s.serialize_field("connections_out", &0)?;
+                s.serialize_field("last_seen", &since.elapsed().as_secs())?;
+                s.end()
+            }
+            PeerConnectionStatus::Unknown => {
+                s.serialize_field("status", "unknown")?;
+                s.serialize_field("connections_in", &0)?;
+                s.serialize_field("connections_out", &0)?;
+                s.serialize_field("last_seen", &0)?;
+                s.end()
+            }
+        }
+    }
 }
