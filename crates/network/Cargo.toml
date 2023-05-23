@@ -8,13 +8,17 @@ version = "0.1.0"
 [dependencies]
 async-std = {version = "1.12", features = ["attributes"]}
 async-trait = "0.1"
+clap = {version = "4.3.0", features = ["derive"]}
+either = "1.8"
 env_logger = "0.10"
 futures = "0.3.28"
 multiaddr = {version = "0.17.1"}
 serde = {version = "1.0.116", features = ["derive"]}
 serde_derive = "1.0.116"
+void = "1.0.2"
 
 [dependencies.libp2p]
 default-features = false
-features = ["websocket", "identify", "mplex", "yamux", "noise", "gossipsub", "dns", "tcp", "tokio", "plaintext", "secp256k1", "macros", "ecdsa"]
-version = "0.50.0"
+# features = ["websocket", "identify", "mplex", "yamux", "noise", "gossipsub", "dns", "tcp", "tokio", "plaintext", "secp256k1", "macros", "ecdsa"]
+features = ["async-std", "dns", "kad", "noise", "macros", "request-response", "tcp", "websocket", "yamux"]
+version = "0.51.3"
