@@ -20,5 +20,5 @@ void = "1.0.2"
 [dependencies.libp2p]
 default-features = false
 # features = ["websocket", "identify", "mplex", "yamux", "noise", "gossipsub", "dns", "tcp", "tokio", "plaintext", "secp256k1", "macros", "ecdsa"]
-features = ["async-std", "dns", "kad", "noise", "macros", "request-response", "tcp", "websocket", "yamux"]
+features = ["async-std", "dns", "kad", "noise", "macros", "tokio", "request-response", "tcp", "websocket", "yamux"]
 version = "0.51.3"

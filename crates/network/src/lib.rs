@@ -1,29 +1,30 @@
+mod transport;
+
 use async_std::io;
-use async_trait::async_trait;
 use either::Either;
 use futures::channel::{mpsc, oneshot};
 use futures::prelude::*;
+use std::sync::Arc;
 
 use libp2p::{
-    core::{
-        upgrade::{read_length_prefixed, write_length_prefixed},
-        Multiaddr,
-    },
+    core::Multiaddr,
     identity,
     kad::{
         record::store::MemoryStore, GetProvidersOk, Kademlia, KademliaEvent, QueryId, QueryResult,
     },
     multiaddr::Protocol,
-    noise,
-    request_response::{self, ProtocolSupport, RequestId, ResponseChannel},
+    request_response::RequestId,
     swarm::{NetworkBehaviour, Swarm, SwarmBuilder, SwarmEvent},
-    tcp, yamux, PeerId, Transport,
+    PeerId,
 };
 
-use libp2p::core::upgrade::Version;
 use std::collections::{hash_map, HashMap, HashSet};
 use std::error::Error;
-use std::iter;
+
+pub struct Service {
+    /// Bandwidth logging system. Can be queried to know the average bandwidth consumed.
+    bandwidth: Arc<transport::BandwidthSinks>,
+}
 
 /// Creates the network components, namely:
 ///
@@ -33,52 +34,45 @@ use std::iter;
 /// - The network event stream, e.g. for incoming requests.
 ///
 /// - The network task driving the network itself.
-pub(crate) async fn new(
-    secret_key_seed: Option<u8>,
-) -> Result<(Client, impl Stream<Item = Event>, EventLoop), Box<dyn Error>> {
-    // Create a public/private key pair, either random or based on a seed.
-    let id_keys = match secret_key_seed {
-        Some(seed) => {
-            let mut bytes = [0u8; 32];
-            bytes[0] = seed;
-            identity::Keypair::ed25519_from_bytes(bytes).unwrap()
-        }
-        None => identity::Keypair::generate_ed25519(),
-    };
-    let peer_id = id_keys.public().to_peer_id();
+impl Service {
+    pub(crate) async fn new(
+        secret_key_seed: Option<u8>,
+    ) -> Result<(Client, impl Stream<Item = Event>, EventLoop), Box<dyn Error>> {
+        // Create a public/private key pair, either random or based on a seed.
+        let id_keys = match secret_key_seed {
+            Some(seed) => {
+                let mut bytes = [0u8; 32];
+                bytes[0] = seed;
+                identity::Keypair::ed25519_from_bytes(bytes).unwrap()
+            }
+            None => identity::Keypair::generate_ed25519(),
+        };
+        let peer_id = id_keys.public().to_peer_id();
 
-    let transport = tcp::async_io::Transport::default()
-        .upgrade(Version::V1Lazy)
-        .authenticate(noise::Config::new(&id_keys)?)
-        .multiplex(yamux::Config::default())
-        .boxed();
+        let (transport, bandwidth) = transport::new_transport(id_keys.clone(), None, 1024 * 1024);
 
-    // Build the Swarm, connecting the lower layer transport logic with the
-    // higher layer network behaviour logic.
-    let swarm = SwarmBuilder::with_async_std_executor(
-        transport,
-        ComposedBehaviour {
-            kademlia: Kademlia::new(peer_id, MemoryStore::new(peer_id)),
-            request_response: request_response::Behaviour::new(
-                FileExchangeCodec(),
-                iter::once((String::from("/file-exchange/1"), ProtocolSupport::Full)),
-                Default::default(),
-            ),
-        },
-        peer_id,
-    )
-    .build();
+        // Build the Swarm, connecting the lower layer transport logic with the
+        // higher layer network behaviour logic.
+        let swarm = SwarmBuilder::with_async_std_executor(
+            transport,
+            ComposedBehaviour {
+                kademlia: Kademlia::new(peer_id, MemoryStore::new(peer_id)),
+            },
+            peer_id,
+        )
+        .build();
 
-    let (command_sender, command_receiver) = mpsc::channel(0);
-    let (event_sender, event_receiver) = mpsc::channel(0);
+        let (command_sender, command_receiver) = mpsc::channel(0);
+        let (event_sender, event_receiver) = mpsc::channel(0);
 
-    Ok((
-        Client {
-            sender: command_sender,
-        },
-        event_receiver,
-        EventLoop::new(swarm, command_receiver, event_sender),
-    ))
+        Ok((
+            Client {
+                sender: command_sender,
+            },
+            event_receiver,
+            EventLoop::new(swarm, command_receiver, event_sender),
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -136,36 +130,6 @@ impl Client {
             .await
             .expect("Command receiver not to be dropped.");
         receiver.await.expect("Sender not to be dropped.")
-    }
-
-    /// Request the content of the given file from the given peer.
-    pub(crate) async fn request_file(
-        &mut self,
-        peer: PeerId,
-        file_name: String,
-    ) -> Result<Vec<u8>, Box<dyn Error + Send>> {
-        let (sender, receiver) = oneshot::channel();
-        self.sender
-            .send(Command::RequestFile {
-                file_name,
-                peer,
-                sender,
-            })
-            .await
-            .expect("Command receiver not to be dropped.");
-        receiver.await.expect("Sender not be dropped.")
-    }
-
-    /// Respond with the provided file content to the given request.
-    pub(crate) async fn respond_file(
-        &mut self,
-        file: Vec<u8>,
-        channel: ResponseChannel<FileResponse>,
-    ) {
-        self.sender
-            .send(Command::RespondFile { file, channel })
-            .await
-            .expect("Command receiver not to be dropped.");
     }
 }
 
@@ -260,45 +224,6 @@ impl EventLoop {
                 },
             )) => {}
             SwarmEvent::Behaviour(ComposedEvent::Kademlia(_)) => {}
-            SwarmEvent::Behaviour(ComposedEvent::RequestResponse(
-                request_response::Event::Message { message, .. },
-            )) => match message {
-                request_response::Message::Request {
-                    request, channel, ..
-                } => {
-                    self.event_sender
-                        .send(Event::InboundRequest {
-                            request: request.0,
-                            channel,
-                        })
-                        .await
-                        .expect("Event receiver not to be dropped.");
-                }
-                request_response::Message::Response {
-                    request_id,
-                    response,
-                } => {
-                    let _ = self
-                        .pending_request_file
-                        .remove(&request_id)
-                        .expect("Request to still be pending.")
-                        .send(Ok(response.0));
-                }
-            },
-            SwarmEvent::Behaviour(ComposedEvent::RequestResponse(
-                request_response::Event::OutboundFailure {
-                    request_id, error, ..
-                },
-            )) => {
-                let _ = self
-                    .pending_request_file
-                    .remove(&request_id)
-                    .expect("Request to still be pending.")
-                    .send(Err(Box::new(error)));
-            }
-            SwarmEvent::Behaviour(ComposedEvent::RequestResponse(
-                request_response::Event::ResponseSent { .. },
-            )) => {}
             SwarmEvent::NewListenAddr { address, .. } => {
                 let local_peer_id = *self.swarm.local_peer_id();
                 eprintln!(
@@ -380,25 +305,6 @@ impl EventLoop {
                     .get_providers(file_name.into_bytes().into());
                 self.pending_get_providers.insert(query_id, sender);
             }
-            Command::RequestFile {
-                file_name,
-                peer,
-                sender,
-            } => {
-                let request_id = self
-                    .swarm
-                    .behaviour_mut()
-                    .request_response
-                    .send_request(&peer, FileRequest(file_name));
-                self.pending_request_file.insert(request_id, sender);
-            }
-            Command::RespondFile { file, channel } => {
-                self.swarm
-                    .behaviour_mut()
-                    .request_response
-                    .send_response(channel, FileResponse(file))
-                    .expect("Connection to peer to be still open.");
-            }
         }
     }
 }
@@ -406,20 +312,12 @@ impl EventLoop {
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "ComposedEvent")]
 struct ComposedBehaviour {
-    request_response: request_response::Behaviour<FileExchangeCodec>,
     kademlia: Kademlia<MemoryStore>,
 }
 
 #[derive(Debug)]
 enum ComposedEvent {
-    RequestResponse(request_response::Event<FileRequest, FileResponse>),
     Kademlia(KademliaEvent),
-}
-
-impl From<request_response::Event<FileRequest, FileResponse>> for ComposedEvent {
-    fn from(event: request_response::Event<FileRequest, FileResponse>) -> Self {
-        ComposedEvent::RequestResponse(event)
-    }
 }
 
 impl From<KademliaEvent> for ComposedEvent {
@@ -447,93 +345,9 @@ enum Command {
         file_name: String,
         sender: oneshot::Sender<HashSet<PeerId>>,
     },
-    RequestFile {
-        file_name: String,
-        peer: PeerId,
-        sender: oneshot::Sender<Result<Vec<u8>, Box<dyn Error + Send>>>,
-    },
-    RespondFile {
-        file: Vec<u8>,
-        channel: ResponseChannel<FileResponse>,
-    },
 }
 
 #[derive(Debug)]
 pub(crate) enum Event {
-    InboundRequest {
-        request: String,
-        channel: ResponseChannel<FileResponse>,
-    },
-}
-
-// Simple file exchange protocol
-
-#[derive(Clone)]
-struct FileExchangeCodec();
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileRequest(String);
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FileResponse(Vec<u8>);
-
-#[async_trait]
-impl request_response::Codec for FileExchangeCodec {
-    type Protocol = String;
-    type Request = FileRequest;
-    type Response = FileResponse;
-
-    async fn read_request<T>(&mut self, _: &String, io: &mut T) -> io::Result<Self::Request>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        let vec = read_length_prefixed(io, 1_000_000).await?;
-
-        if vec.is_empty() {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-
-        Ok(FileRequest(String::from_utf8(vec).unwrap()))
-    }
-
-    async fn read_response<T>(&mut self, _: &String, io: &mut T) -> io::Result<Self::Response>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        let vec = read_length_prefixed(io, 500_000_000).await?; // update transfer maximum
-
-        if vec.is_empty() {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-
-        Ok(FileResponse(vec))
-    }
-
-    async fn write_request<T>(
-        &mut self,
-        _: &String,
-        io: &mut T,
-        FileRequest(data): FileRequest,
-    ) -> io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        write_length_prefixed(io, data).await?;
-        io.close().await?;
-
-        Ok(())
-    }
-
-    async fn write_response<T>(
-        &mut self,
-        _: &String,
-        io: &mut T,
-        FileResponse(data): FileResponse,
-    ) -> io::Result<()>
-    where
-        T: AsyncWrite + Unpin + Send,
-    {
-        write_length_prefixed(io, data).await?;
-        io.close().await?;
-
-        Ok(())
-    }
+    InboundRequest { request: String },
 }
